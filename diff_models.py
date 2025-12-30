@@ -227,16 +227,14 @@ class FreqThresholdSelectiveDiffusionEmbedding(nn.Module):
         projection_dim: int = None,
         max_freq: float = 100.0,
         t2f: str = 'dft',
+        pool: str = 'mean',
         gamma_thr: float = 1.0,
-        tau: float = 0.7,
+        tau: float = 0.3,
         eps: float = 1e-6,
         gate_floor: float = 0.3,
         detach_gate: bool = True,
-        normalize_gate: bool = True,
-        logit_clamp: float = 12.0,
-        threshold_calib: str = 'global_ema',
-        ema_decay: float = 0.99,
-        power_reduce: str = 'mean',
+        normalize_gate: bool = False,
+        logit_clamp: float = 12.0
     ):
         super().__init__()
         assert d_model%2 == 0, "d_model must be even"
@@ -245,17 +243,14 @@ class FreqThresholdSelectiveDiffusionEmbedding(nn.Module):
         self.num_steps = num_steps
         self.d_model = d_model
         self.dim = d_model // 2
+        self.pool = pool
         self.gamma_thr = gamma_thr
         self.tau = tau
         self.eps = eps
         self.gate_floor = gate_floor
         self.detach_gate = detach_gate
         self.normalize_gate = normalize_gate
-        self.logit_clamp = logit_clamp
-        self.threshold_calib = threshold_calib
-        self.ema_decay = ema_decay
-        self.power_reduce = power_reduce
-
+        
         if t2f == 'dft':
             self.t2f = dft_unitary
         elif t2f == 'dct':
@@ -266,42 +261,12 @@ class FreqThresholdSelectiveDiffusionEmbedding(nn.Module):
             raise NotImplementedError("Unsupported transformation:{t2f}")
         
         self.register_buffer(
-            "freq_u_dim", 
-            torch.linspace(0.0, 1.0, self.dim),
+            "freq_bands",
+            torch.linspace(1.0, max_freq, self.dim),
             persistent=False
         )
-        self.register_buffer(
-            "freq_bands_dim",
-            torch.linspace(0.0, max_freq, self.dim),
-            persistent=False
-        )
-
-        if self.threshold_calib == 'global_ema':
-            self.register_buffer("global_scale_ema", torch.tensor(1.0), persistent=True)
-
         self.proj1 = nn.Linear(d_model, projection_dim)
         self.proj2 = nn.Linear(projection_dim, projection_dim)
-
-    # def _compute_scale(
-    #     self,
-    #     P_band: torch.Tensor
-    # ) -> torch.Tensor:
-    #     if self.threshold_calib == "none":
-    #         return torch.ones(P_band.size(0), 1, device=P_band.device, dtype=P_band.dtype)
-
-    #     if self.threshold_calib == "median":
-    #         s = P_band.detach().median(dim=-1, keepdim=True).values  # (B,1)
-    #         return s.clamp_min(self.eps)
-
-    #     if self.threshold_calib == "mean":
-    #         s = P_band.detach().mean(dim=-1, keepdim=True)  # (B,1)
-    #         return s.clamp_min(self.eps)
-
-    #     if self.threshold_calib == "global_ema":
-    #         batch_med = P_band.detach().median().clamp_min(self.eps)
-    #         self.global_scale_ema = self.global_scale_ema * self.ema_decay + batch_med * (1.0 - self.ema_decay)
-    #         s = self.global_scale_ema.to(P_band.dtype)
-    #         return s.view(1, 1).expand(P_band.size(0), 1)
 
     def _power_spectrum(
         self,
@@ -336,77 +301,36 @@ class FreqThresholdSelectiveDiffusionEmbedding(nn.Module):
             return P
         else:
             return z.pow(2)
-    def _reduce_channels(self, P: torch.Tensor) -> torch.Tensor:
-        """
-        P: (B,K,N) -> (B,N)
-        """
-        if self.power_reduce == "mean":
-            return P.mean(dim=1)
-        if self.power_reduce == "median":
-            return P.median(dim=1).values
-        raise ValueError(f"power_reduce must be mean/median, got {self.power_reduce}")
 
-    @torch.no_grad()
-    def _update_global_scale_ema(self, P_bin: torch.Tensor):
-        """
-        P_bin: (B,N) power on bins, update scalar EMA using global median.
-        """
-        # scalar median over all (B,N)
-        batch_med = P_bin.detach().median().clamp_min(self.eps)
-        self.global_scale_ema.mul_(self.ema_decay).add_(batch_med * (1.0 - self.ema_decay))
-
-    def _get_scale(self, P_bin: torch.Tensor) -> torch.Tensor:
-        """
-        return scale: (1,1) or (B,1) depending on calibration strategy
-        """
-        if self.threshold_calib == "none":
-            return torch.ones(1, 1, device=P_bin.device, dtype=P_bin.dtype)
-        if self.threshold_calib == "global_ema":
-            # update only during training to avoid eval-time drift
-            if self.training:
-                self._update_global_scale_ema(P_bin)
-            s = self.global_scale_ema.to(dtype=P_bin.dtype, device=P_bin.device).clamp_min(self.eps)
-            return s.view(1, 1)
-        raise ValueError(f"threshold_calib must be none/global_ema, got {self.threshold_calib}")
-
-    def _interp_1d(self, x: torch.Tensor, out_len: int) -> torch.Tensor:
-        """
-        x: (B,N) -> (B,out_len) via linear interpolation
-        """
-        x_ = x.unsqueeze(1)  # (B,1,N)
-        y_ = F.interpolate(x_, size=out_len, mode="linear", align_corners=False)
-        return y_.squeeze(1)
-
-    
-    # def _band_pool_1d(
-    #     self,
-    #     p: torch.Tensor,
-    #     out_dim: int,
-    # ) -> torch.Tensor:
-    #     B, N = p.shape
-    #     if N % out_dim != 0:
-    #         pad = out_dim - (N%out_dim)
-    #         p = F.pad(p, (0, pad), mode="constant", value=0.0)
-    #         N2 = p.size(-1)
-    #     else:
-    #         N2 = N
+    def _band_pool_1d(
+        self,
+        p: torch.Tensor,
+        out_dim: int,
+    ) -> torch.Tensor:
+        B, N = p.shape
+        if N % out_dim != 0:
+            pad = out_dim - (N%out_dim)
+            p = F.pad(p, (0, pad), mode="constant", value=0.0)
+            N2 = p.size(-1)
+        else:
+            N2 = N
         
-    #     g = N2 // out_dim
-    #     p = p.view(B, out_dim, g)
-    #     if self.pool == "sum":
-    #         band = p.sum(dim=-1)
-    #     elif self.pool == "mean":
-    #         band = p.mean(dim=-1)
-    #     else:
-    #         raise NotImplementedError("band pooling should be mean or sum, got {}".format(self.pool)) 
-    #     return band
+        g = N2 // out_dim
+        p = p.view(B, out_dim, g)
+        if self.pool == "sum":
+            band = p.sum(dim=-1)
+        elif self.pool == "mean":
+            band = p.mean(dim=-1)
+        else:
+            raise NotImplementedError("band pooling should be mean or sum, got {}".format(self.pool)) 
+        return band
     
-    # def _band_pool(
-    #     self, 
-    #     power: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     power = power.mean(dim=1)
-    #     return self._band_pool_1d(power, self.dim)
+    def _band_pool(
+        self, 
+        power: torch.Tensor,
+    ) -> torch.Tensor:
+        power = power.mean(dim=1)
+        return self._band_pool_1d(power, self.dim)
 
     def forward(
         self,
@@ -416,46 +340,32 @@ class FreqThresholdSelectiveDiffusionEmbedding(nn.Module):
     ) -> torch.Tensor:
         B = diffusion_step.shape[0]
         device = diffusion_step.device
+        fb = self.freq_bands.to(device)
 
-        # evaluating P_t(\omega)
-        z = self.t2f(signal_proxy.to(torch.float32))   # (B,K,L*)
+        # 估计 P_t(ω)
+        z = self.t2f(signal_proxy.float())   # (B,K,L*)
         P = self._power_spectrum(z)          # (B,K,Nfreq)
+        P_band = self._band_pool(P)          # (B,dim)
 
-        P_bin = self._reduce_channels(P)
-        Nbin = P_bin.size(-1)
+        # 阈值 T(t) = γ * N(t)
+        Nt = N_t.view(B, 1).to(device=device, dtype=P_band.dtype)
+        T = (self.gamma_thr * Nt).clamp_min(self.eps)
 
-        Nt = N_t.view(B, 1).to(device=device, dtype=P_bin.dtype).clamp_min(self.eps)
-        scale = self._get_scale(P_bin).to(P_bin.dtype)
-        T = (self.gamma_thr * Nt * scale).clamp_min(self.eps)
-
-        logP = torch.log(P_bin + self.eps)
+        # soft 阈值：关注 P >= T
+        logP = torch.log(P_band + self.eps)
         logT = torch.log(T + self.eps)
-        x = (logP - logT) / max(self.tau, self.eps)
-
-        if self.logit_clamp is not None:
-            x = x.clamp(-self.logit_clamp, self.logit_clamp)
-
-        gate_bin = torch.sigmoid(x)                    # (B,Nbin)
-        gate_bin = self.gate_floor + (1.0 - self.gate_floor) * gate_bin
-
-        # ===== map gate from bins -> dim =====
-        gate = self._interp_1d(gate_bin, self.dim)     # (B,dim)
+        gate = torch.sigmoid((logP - logT) / max(self.tau, 1e-6))  # (B,dim)
+        gate = self.gate_floor + (1.0 - self.gate_floor) * gate
 
         if self.detach_gate:
             gate = gate.detach()
         if self.normalize_gate:
-            gate = gate / (gate.mean(dim=-1, keepdim=True) + self.eps)
+            gate = gate / (gate.mean(dim=-1, keepdim=True) + 1e-6)
 
-        # ===== build basis aligned with interpolation grid =====
-        fb = self.freq_bands_dim.to(device=device, dtype=gate.dtype)  # (dim,)
-
-        t = diffusion_step.to(dtype=gate.dtype).unsqueeze(-1)         # (B,1)
-        phase = t * fb.unsqueeze(0)                                   # (B,dim)
-
-        emb = torch.cat(
-            [torch.sin(phase) * gate, torch.cos(phase) * gate],
-            dim=-1
-        )
+        # gated step basis
+        t = diffusion_step.float().unsqueeze(-1)      # (B,1)
+        phase = t * fb.unsqueeze(0)                   # (B,dim)
+        emb = torch.cat([torch.sin(phase) * gate, torch.cos(phase) * gate], dim=-1)  # (B,d_model)
 
         x = self.proj1(emb)
         x = F.silu(x)
@@ -609,22 +519,22 @@ class diff_CD2(nn.Module):
             num_steps=config["num_steps"],
             embedding_dim=config["time_diffusion_embedding_dim"],
         )
-        # self.freq_diffusion_embedding = HighPassDiffusionEmbedding(
-        #     num_steps=config["num_steps"],
-        #     embedding_dim=config["freq_diffusion_embedding_dim"],
-        # )
+        self.freq_diffusion_embedding = HighPassDiffusionEmbedding(
+            num_steps=config["num_steps"],
+            embedding_dim=config["freq_diffusion_embedding_dim"],
+        )
         # self.freq_diffusion_embedding = EnergyAdaptiveDiffusionEmbedding(
         #     num_steps=config["num_steps"],
         #     d_model=config["freq_diffusion_embedding_dim"],
         #     t2f=config["trans"],
         #     kappa=0.5
         # )
-        self.freq_diffusion_embedding = FreqThresholdSelectiveDiffusionEmbedding(
-            num_steps=config["num_steps"],
-            d_model=config["freq_diffusion_embedding_dim"],
-            projection_dim=config["freq_diffusion_embedding_dim"],
-            t2f=config["trans"],
-        )
+        # self.freq_diffusion_embedding = FreqThresholdSelectiveDiffusionEmbedding(
+        #     num_steps=config["num_steps"],
+        #     d_model=config["freq_diffusion_embedding_dim"],
+        #     projection_dim=config["freq_diffusion_embedding_dim"],
+        #     t2f=config["trans"],
+        # )
 
         self.input_projection = Conv1d_with_init(inputdim, self.channels, 1)
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
@@ -680,7 +590,7 @@ class diff_CD2(nn.Module):
         x = x.reshape(B, K, L)
         return x
     
-    def forward_freq(self, x, cond_info_f, diffusion_step, N_t, signal_proxy):
+    def forward_freq(self, x, cond_info_f, diffusion_step):
         B, inputdim, K, L = x.shape
         x = x.reshape(B*inputdim, K, L)
         x = self.t2f(x)
@@ -688,12 +598,12 @@ class diff_CD2(nn.Module):
         x = self.input_projection_f(x)
         x = F.relu(x)
         x = x.reshape(B, self.channels, K, L)
-        # freq_diffusion_emb = self.freq_diffusion_embedding(diffusion_step)
-        freq_diffusion_emb = self.freq_diffusion_embedding(
-            diffusion_step = diffusion_step,
-            N_t = N_t,
-            signal_proxy = signal_proxy
-        )
+        freq_diffusion_emb = self.freq_diffusion_embedding(diffusion_step)
+        # freq_diffusion_emb = self.freq_diffusion_embedding(
+        #     diffusion_step = diffusion_step,
+        #     N_t = N_t,
+        #     signal_proxy = signal_proxy
+        # )
         skip_f = []
         for layer in self.residual_layers_f:
             x, skip_connection_f = layer(x, cond_info_f, freq_diffusion_emb)
