@@ -308,13 +308,12 @@ class CD2_base(nn.Module):
 
         # predict frequency noise (standard normal in frequency branch mapped to time domain)
         inp_f = self.set_input_to_diffmodel_f(x_t_time, observed_data, cond_mask)
-        # N_t = (1.0 - self.alpha_bar_torch_f[t]).to(observed_data.dtype)
-        N_t = sigma2.view(B).to(observed_data.dtype)
-        signal_proxy = (x_t_time * (1.0 - cond_mask) + observed_data * cond_mask).detach()
-        pred_f = self.diffmodel.forward_freq(inp_f, side_info_f, t, N_t=N_t, signal_proxy=signal_proxy)
+        pred_f = self.diffmodel.forward_freq(inp_f, side_info_f, t)
 
         # uncertainty-aware frequency domain scaling
-        pred_f_time = sigma_f * self.f2t(G * pred_f)
+        cond_obs = cond_mask * observed_data
+        w = self.build_freq_weight(cond_mask,cond_obs)
+        pred_f_time = sigma_f * self.f2t(G *(w * pred_f))
         loss_freq = (((true_f - pred_f_time) * target_mask) ** 2).sum() / denom
 
         # optional consistency loss across branches
@@ -372,43 +371,6 @@ class CD2_base(nn.Module):
 
         G = self.noise_scaling(L, device=device)
 
-        @torch.no_grad()
-        def build_sigma2_table():
-            T = self.num_steps
-            alpha_bar_t = self.alpha_bar_torch.to(device=device, dtype=dtype)
-            alpha_bar_f = self.alpha_bar_torch_f.to(device=device, dtype=dtype)
-            alpha_hat_f = self.alpha_hat_torch_f.to(device=device, dtype=dtype)
-
-            lam = self.lambda_mix
-            sqrt_1m_lam2 = (1.0 - lam)  # (sqrt_1m_lam)^2
-
-            table = torch.zeros(T, device=device, dtype=dtype)
-
-            for k in range(T):
-                s_idx = torch.arange(0, k + 1, device=device, dtype=torch.long)
-
-                # chain_t = alpha_bar_t[k] / alpha_bar_t[s-1], with s=0 -> denom=1
-                alpha_bar_t_sminus1 = torch.ones_like(s_idx, dtype=dtype, device=device)
-                if k >= 1:
-                    pos = s_idx > 0
-                    alpha_bar_t_sminus1[pos] = alpha_bar_t[s_idx[pos] - 1]
-                chain_t = alpha_bar_t[k] / alpha_bar_t_sminus1
-
-                # chain_f = alpha_bar_f[k] / alpha_bar_f[s], with s=k -> denom=1
-                alpha_bar_f_s = torch.ones_like(s_idx, dtype=dtype, device=device)
-                if k >= 1:
-                    pos2 = s_idx < k
-                    alpha_bar_f_s[pos2] = alpha_bar_f[s_idx[pos2]]
-                chain_f = alpha_bar_f[k] / alpha_bar_f_s
-
-                sb_f = 1.0 - alpha_hat_f[s_idx]  # (k+1,)
-                w2 = sqrt_1m_lam2 * sb_f * chain_t * chain_f
-                table[k] = w2.sum()
-
-            return table  # (T,)
-
-        sigma2_table = build_sigma2_table()
-
         def init_prior(B, K, L):
             z_t = torch.randn(B, K, L, device=device, dtype=dtype)
             z_f = torch.randn(B, K, L, device=device, dtype=dtype)
@@ -433,18 +395,16 @@ class CD2_base(nn.Module):
 
                 # (2) frequency denoise
                 inp_f = self.set_input_to_diffmodel_f(x_time, observed_data, cond_mask)
-                N_t = sigma2_table[tt].expand(B)
-                signal_proxy = (x_time * (1.0 - cond_mask) + observed_data * cond_mask).detach()
-                pred_f = self.diffmodel.forward_freq(inp_f, side_info_f, t_batch, N_t=N_t, signal_proxy=signal_proxy)
+                pred_f = self.diffmodel.forward_freq(inp_f, side_info_f, t_batch)
 
-                # # uncertainty-aware frequency weighting
-                # w = self.build_freq_weight(cond_mask, cond_obs)
+                # uncertainty-aware frequency weighting
+                cond_obs = cond_mask * observed_data
+                w = self.build_freq_weight(cond_mask, cond_obs)
 
-                step_freq = sqrt_1m_lam * sqrt_beta_f[tt].view(1, 1, 1) * self.f2t(G * pred_f)
+                step_freq = sqrt_1m_lam * sqrt_beta_f[tt].view(1, 1, 1) * self.f2t(G * (w * pred_f))
                 inv_sqrt_af = inv_sqrt_alpha_f[tt].view(1, 1, 1)
                 x_prev = (x_time - step_freq) * inv_sqrt_af
 
-                x_prev = cond_mask * observed_data + (1.0 - cond_mask) * x_prev
                 # (3) optional stochasticity can be added here if needed
 
                 x_t_cur = x_prev
